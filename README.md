@@ -2,6 +2,10 @@
 
 An offline, interactive architectural documentation site for `leasepool` 0.1.3.
 
+## Live site
+
+[Open the leasepool Architecture Atlas](https://jackofsometrades99.github.io/leasepool-architecture-site/)
+
 ## Open it
 
 Open `index.html` directly in a modern browser. No build step, package manager, web server, external font, CDN, or network connection is required.
