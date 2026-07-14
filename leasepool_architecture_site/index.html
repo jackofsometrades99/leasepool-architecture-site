@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#070b17" />
+  <meta name="description" content="Interactive graphical and architectural documentation for leasepool — executor leasing, backpressure, batching, lifecycle, and adaptive offloading for asyncio." />
+  <title>leasepool · Interactive Architecture</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+  <div class="cursor-glow" aria-hidden="true"></div>
+
+  <header class="topbar" id="topbar">
+    <a class="brand" href="#hero" aria-label="leasepool architecture home">
+      <span class="brand-mark"><i></i><i></i><i></i></span>
+      <span><b>leasepool</b><small>architecture atlas</small></span>
+    </a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a href="#architecture">Architecture</a>
+      <a href="#lifecycle">Lifecycle</a>
+      <a href="#concurrency">Concurrency lab</a>
+      <a href="#internals">Internals</a>
+      <a href="#api">API map</a>
+    </nav>
+    <div class="topbar-actions">
+      <button class="icon-button" id="reduceMotion" aria-pressed="false" title="Toggle reduced motion">
+        <span class="motion-icon">◌</span><span class="sr-only">Toggle reduced motion</span>
+      </button>
+      <a class="pill-button small" href="#quickstart">Quickstart <span>↘</span></a>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero section" id="hero">
+      <div class="hero-backdrop" aria-hidden="true"></div>
+      <div class="hero-copy reveal">
+        <div class="eyebrow"><span class="status-dot"></span> Interactive internals · v0.1.3</div>
+        <h1>Bounded executor capacity,<br /><em>made visible.</em></h1>
+        <p class="lede">
+          Follow requests from the asyncio event loop through batching, lease acquisition,
+          executor workers, draining, expiry, recovery, and result delivery—without treating
+          concurrency as a black box.
+        </p>
+        <div class="hero-actions">
+          <a class="pill-button primary" href="#architecture">Explore the system <span>↓</span></a>
+          <button class="pill-button ghost" data-set-mode="grinder">Play batch flow <span>▶</span></button>
+          <a class="pill-button ghost" href="https://github.com/jackofsometrades99/leasepool" target="_blank" rel="noopener noreferrer">View on GitHub <span>↗</span></a>
+        </div>
+        <div class="hero-proof">
+          <div><strong>Bounded</strong><span>up to max_pools</span></div>
+          <div><strong>Exclusive</strong><span>one executor per lease</span></div>
+          <div><strong>Loop-safe</strong><span>sync work stays off-loop</span></div>
+          <div><strong>Self-healing</strong><span>broken pools retire</span></div>
+        </div>
+      </div>
+
+      <div class="hero-stage reveal" id="architecture">
+        <div class="stage-toolbar">
+          <div class="segmented" role="tablist" aria-label="Architecture scenario">
+            <button class="active" role="tab" aria-selected="true" data-mode="direct">Direct lease</button>
+            <button role="tab" aria-selected="false" data-mode="grinder">WorkGrinder</button>
+            <button role="tab" aria-selected="false" data-mode="expiry">Hard expiry</button>
+            <button role="tab" aria-selected="false" data-mode="broken">Broken pool</button>
+            <button role="tab" aria-selected="false" data-mode="logging">Process logs</button>
+          </div>
+          <!-- <div class="stage-legend"><span class="legend-dot moving"></span><span id="modeCaption">request → lease → executor → result</span></div> -->
+        </div>
+        <div class="scene-wrap">
+          <canvas id="architectureCanvas" aria-label="Interactive 3D architecture of the leasepool library"></canvas>
+          <!-- <div class="scene-hint"><span>drag to orbit</span><span>scroll to zoom</span><span>select a node</span></div> -->
+          <aside class="node-inspector" id="nodeInspector" aria-live="polite">
+            <button
+              class="inspector-close"
+              id="inspectorClose"
+              type="button"
+              aria-label="Close selected component"
+              title="Close"
+            >×</button>
+
+            <div class="inspector-kicker">Selected component</div>
+            <h3 id="inspectorTitle">LeasedExecutorManager</h3>
+            <p id="inspectorBody">Owns bounded executor pools, arbitrates leases, tracks futures, and enforces lifecycle rules.</p>
+            <div class="inspector-tags" id="inspectorTags">
+              <span>async boundary</span><span>RLock state</span><span>backpressure</span>
+            </div>
+          </aside>
+        </div>
+        <div class="stage-metrics" id="stageMetrics">
+          <div><span>pending</span><b id="metricPending">0</b></div>
+          <div><span>available</span><b id="metricAvailable">1</b></div>
+          <div><span>leased</span><b id="metricLeased">1</b></div>
+          <div><span>draining</span><b id="metricDraining">0</b></div>
+          <div><span>results</span><b id="metricResults">24</b></div>
+        </div>
+      </div>
+
+      <div class="scroll-cue" aria-hidden="true"><span></span>scroll to trace the protocol</div>
+    </section>
+
+    <section class="section anatomy" id="system-map">
+      <div class="section-heading reveal">
+        <div class="eyebrow">01 · System anatomy</div>
+        <h2>A capacity protocol around<br /><em>concurrent.futures.</em></h2>
+        <p>leasepool does not replace Python executors. It wraps their ownership and turns executor access into a bounded, observable lifecycle.</p>
+      </div>
+
+      <div class="layer-stack reveal">
+        <article class="layer-card user-layer">
+          <div class="layer-index">01</div>
+          <div class="layer-symbol">{ }</div>
+          <div>
+            <h3>Application callers</h3>
+            <p>Async routes, jobs, services, or non-owner threads submit synchronous functions and input payloads.</p>
+          </div>
+          <div class="layer-interface"><code>await lease.run(fn, data)</code><code>await grinder.submit(fn, data)</code></div>
+        </article>
+        <div class="layer-connector"><i></i><span>async Future / result</span><i></i></div>
+        <article class="layer-card coordination-layer">
+          <div class="layer-index">02</div>
+          <div class="layer-symbol orbit-symbol"><i></i><i></i></div>
+          <div>
+            <h3>Async coordination plane</h3>
+            <p><b>WorkGrinder</b> batches demand. <b>LeasedExecutorManager</b> applies capacity limits, waiting, adaptive sizing, and expiry.</p>
+          </div>
+          <div class="layer-interface"><code>asyncio.Condition</code><code>asyncio.Event</code><code>checker task</code></div>
+        </article>
+        <div class="layer-connector"><i></i><span>safe proxy + tracked Future</span><i></i></div>
+        <article class="layer-card sync-layer">
+          <div class="layer-index">03</div>
+          <div class="layer-symbol lock-symbol">⌁</div>
+          <div>
+            <h3>Synchronous state boundary</h3>
+            <p>A <b>threading.RLock</b> guards executor ownership because <code>Executor.submit()</code> is synchronous and completion callbacks may run on backend threads.</p>
+          </div>
+          <div class="layer-interface"><code>_available</code><code>_leased</code><code>pending_futures</code></div>
+        </article>
+        <div class="layer-connector"><i></i><span>submit / callback</span><i></i></div>
+        <article class="layer-card worker-layer">
+          <div class="layer-index">04</div>
+          <div class="layer-symbol worker-symbol"><i></i><i></i><i></i></div>
+          <div>
+            <h3>Executor backends</h3>
+            <p>Thread, process, or Python 3.14+ interpreter executors perform the blocking or CPU-heavy work away from the event loop.</p>
+          </div>
+          <div class="layer-interface"><code>ThreadPoolExecutor</code><code>ProcessPoolExecutor</code><code>InterpreterPoolExecutor</code></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section protocol" id="protocol">
+      <div class="section-heading reveal">
+        <div class="eyebrow">02 · Request / result protocol</div>
+        <h2>Follow the request<br /><em>without losing the plot.</em></h2>
+        <p>Choose a path to see the complete journey at once. Every stage stays readable; a focused highlight simply shows where you are.</p>
+      </div>
+
+      <div class="protocol-explorer reveal">
+        <div class="protocol-toolbar">
+          <div class="sequence-tabs" role="tablist" aria-label="Request path">
+            <button class="active" data-sequence="lease">Direct lease</button>
+            <button data-sequence="grinder">Batched work</button>
+            <button data-sequence="thread">Cross-thread entry</button>
+          </div>
+          <div class="protocol-readable"><span>✓</span> All stages remain visible</div>
+        </div>
+
+        <div class="protocol-overview">
+          <div class="protocol-intro">
+            <span class="protocol-kicker">Selected path</span>
+            <h3 id="sequenceTitle">Direct lease</h3>
+            <p id="sequenceSummary">One caller reserves bounded capacity, runs synchronous work away from the event loop, and releases the executor safely.</p>
+
+            <div class="protocol-route" id="protocolRoute" aria-label="Direct lease route">
+              <div class="route-actor" data-route-index="0"><i>01</i><span id="routeActor0">Caller</span></div>
+              <b aria-hidden="true">→</b>
+              <div class="route-actor" data-route-index="1"><i>02</i><span id="routeActor1">Event loop</span></div>
+              <b aria-hidden="true">→</b>
+              <div class="route-actor" data-route-index="2"><i>03</i><span id="routeActor2">Manager</span></div>
+              <b aria-hidden="true">→</b>
+              <div class="route-actor" data-route-index="3"><i>04</i><span id="routeActor3">Executor</span></div>
+            </div>
+          </div>
+
+          <aside class="protocol-outcome">
+            <span>What the caller gets</span>
+            <strong id="sequenceOutcome">The exact value, exception, or cancellation from its own submission.</strong>
+            <div><i></i><p><b>Loop stays responsive</b><small>Synchronous work runs on the selected backend.</small></p></div>
+          </aside>
+        </div>
+
+        <ol class="protocol-steps" id="sequenceSteps" aria-label="Request stages"></ol>
+
+        <div class="sequence-controls">
+          <div class="sequence-progress" aria-hidden="true"><i id="sequenceProgress"></i></div>
+          <span id="sequenceStepLabel">Stage 1 of 6 · Request capacity</span>
+          <button class="protocol-next" id="sequenceReplay" type="button">Next stage <span>→</span></button>
+        </div>
+
+        <div class="protocol-guarantees" aria-label="Protocol guarantees">
+          <article><span>01</span><div><b>Coordinate on-loop</b><p>The event loop schedules and tracks work; it never executes the blocking callable.</p></div></article>
+          <article><span>02</span><div><b>Track every outcome</b><p>Each backend future remains tied to the lease and to the caller that created it.</p></div></article>
+          <article><span>03</span><div><b>Drain before reuse</b><p>Release stops new submissions immediately; recycling waits until pending work reaches zero.</p></div></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section lifecycle" id="lifecycle">
+      <div class="section-heading reveal">
+        <div class="eyebrow">03 · Lease lifecycle</div>
+        <h2>The executor is reusable only<br /><em>when the state says so.</em></h2>
+        <p>Choose a scenario to see how the same executor leaves—or safely returns to—the managed pool.</p>
+      </div>
+
+      <div class="lifecycle-board reveal">
+        <div class="lifecycle-controls">
+          <button class="active" data-lifecycle="normal"><span>✓</span>Normal release</button>
+          <button data-lifecycle="drain"><span>⌛</span>Release while busy</button>
+          <button data-lifecycle="expire"><span>◷</span>Hard expiry</button>
+          <button data-lifecycle="broken"><span>!</span>Broken executor</button>
+          <button data-lifecycle="shrink"><span>↘</span>Adaptive shrink</button>
+        </div>
+        <div class="state-machine" id="stateMachine">
+          <div class="state-card active" data-state="available"><span class="state-number">A</span><h3>Available</h3><p>Idle executor in <code>_available</code>.</p><small>may be leased</small></div>
+          <div class="state-path" data-path="acquire"><i></i><span>acquire()</span></div>
+          <div class="state-card" data-state="leased"><span class="state-number">L</span><h3>Leased</h3><p>Exclusive proxy; submissions tracked.</p><small>active lease record</small></div>
+          <div class="state-path" data-path="release"><i></i><span>release()</span></div>
+          <div class="state-card" data-state="draining"><span class="state-number">D</span><h3>Draining</h3><p>Closed to new work; futures still running.</p><small>release_requested = True</small></div>
+          <div class="state-path" data-path="finalize"><i></i><span>future callback</span></div>
+          <div class="state-card" data-state="decision"><span class="state-number">?</span><h3>Finalize</h3><p>Keep only if healthy, unexpired, and within target.</p><small>projected_total ≤ desired</small></div>
+          <div class="state-branch recycle" data-branch="recycle"><i></i><span>reuse</span></div>
+          <div class="state-branch retire" data-branch="retire"><i></i><span>shutdown</span></div>
+        </div>
+        <div class="lifecycle-footer">
+          <div class="event-terminal" id="lifecycleTerminal" aria-live="polite">
+            <div><span>00:00.000</span><b>executor-1 created</b><em>total=1 available=1</em></div>
+            <div><span>00:00.014</span><b>lease granted</b><em>available=0 leased=1</em></div>
+            <div><span>00:00.228</span><b>lease released</b><em>pending=0 draining=False</em></div>
+            <div><span>00:00.230</span><b>executor returned</b><em>kept=True available=1</em></div>
+          </div>
+          <div class="expiry-clock">
+            <div class="clock-label"><span>lease clock</span><b id="clockStatus">healthy</b></div>
+            <div class="clock-track"><i class="soft-marker"></i><i class="hard-marker"></i><span id="clockFill"></span><b id="clockNeedle"></b></div>
+            <div class="clock-scale"><span>leased_at</span><span>soft expiry</span><span>hard expiry</span></div>
+            <p id="clockExplanation">Soft expiry is informational. Submission remains valid through grace; hard expiry revokes the lease.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section concurrency" id="concurrency">
+      <div class="section-heading reveal">
+        <div class="eyebrow">04 · Interactive concurrency lab</div>
+        <h2>Turn the knobs.<br /><em>Watch pressure move.</em></h2>
+        <p>This conceptual simulator mirrors the library’s control rules: batching triggers, bounded pools, workers per pool, draining, and result flow.</p>
+      </div>
+
+      <div class="lab-shell reveal">
+        <aside class="lab-controls">
+          <div class="lab-control">
+            <div><label for="arrivalRate">Incoming work</label><output id="arrivalRateOut">12 / sec</output></div>
+            <input id="arrivalRate" type="range" min="1" max="30" value="12" />
+          </div>
+          <div class="lab-control">
+            <div><label for="taskCost">Task cost</label><output id="taskCostOut">420 ms</output></div>
+            <input id="taskCost" type="range" min="80" max="1200" step="20" value="420" />
+          </div>
+          <div class="lab-control">
+            <div><label for="maxPools">max_pools</label><output id="maxPoolsOut">3</output></div>
+            <input id="maxPools" type="range" min="1" max="6" value="3" />
+          </div>
+          <div class="lab-control">
+            <div><label for="workersPool">workers_per_pool</label><output id="workersPoolOut">4</output></div>
+            <input id="workersPool" type="range" min="1" max="8" value="4" />
+          </div>
+          <div class="lab-control grinder-control">
+            <div><label for="batchThreshold">batch threshold</label><output id="batchThresholdOut">8</output></div>
+            <input id="batchThreshold" type="range" min="1" max="20" value="8" />
+          </div>
+          <div class="lab-control grinder-control">
+            <div><label for="maxWait">max wait</label><output id="maxWaitOut">600 ms</output></div>
+            <input id="maxWait" type="range" min="100" max="2000" step="100" value="600" />
+          </div>
+          <div class="lab-mode">
+            <span>Ingress path</span>
+            <div class="segmented full">
+              <button data-lab-mode="direct">Direct</button>
+              <button class="active" data-lab-mode="grinder">Grinder</button>
+            </div>
+          </div>
+          <button class="pill-button primary full-width" id="burstButton">Inject 20-task burst <span>＋</span></button>
+          <button class="text-button" id="resetLab">Reset simulation</button>
+        </aside>
+
+        <div class="lab-visual">
+          <div class="lab-topline">
+            <div class="sim-status"><span></span>simulation running</div>
+            <div class="sim-time" id="simTime">T+00:00</div>
+          </div>
+          <div class="flow-rack">
+            <div class="rack-zone ingress-zone">
+              <div class="rack-label"><span>01</span><b>Ingress</b><small>async callers</small></div>
+              <div class="request-stream" id="requestStream"></div>
+            </div>
+            <div class="rack-link"><i></i><span id="rackLinkLabel">enqueue</span></div>
+            <div class="rack-zone queue-zone">
+              <div class="rack-label"><span>02</span><b id="queueZoneTitle">WorkGrinder</b><small id="queueZoneSub">condition + deque</small></div>
+              <div class="queue-display">
+                <div class="queue-meter"><span id="queueFill"></span><b id="queueCount">0</b></div>
+                <div class="queue-dots" id="queueDots"></div>
+              </div>
+              <div class="batch-timer"><span id="batchTimerFill"></span><b id="batchTimerText">oldest 0 ms</b></div>
+            </div>
+            <div class="rack-link"><i></i><span>acquire</span></div>
+            <div class="rack-zone manager-zone">
+              <div class="rack-label"><span>03</span><b>Manager</b><small>bounded pool registry</small></div>
+              <div class="pool-grid" id="poolGrid"></div>
+            </div>
+            <div class="rack-link reverse"><i></i><span>results</span></div>
+            <div class="rack-zone result-zone">
+              <div class="rack-label"><span>04</span><b>Resolved</b><small>values / exceptions</small></div>
+              <div class="result-orbit"><b id="completedCount">0</b><span>completed</span><i></i><i></i></div>
+            </div>
+          </div>
+
+          <div class="lab-dashboard">
+            <div class="metric-card"><span>Queue depth</span><b id="labQueueMetric">0</b><small id="labQueueTrend">stable</small></div>
+            <div class="metric-card"><span>Active workers</span><b id="labWorkersMetric">0 / 12</b><small>across leased pools</small></div>
+            <div class="metric-card"><span>Throughput</span><b id="labThroughputMetric">0.0/s</b><small>rolling completion rate</small></div>
+            <div class="metric-card"><span>Loop pressure</span><b id="labPressureMetric">low</b><small>coordination only</small></div>
+          </div>
+
+          <div class="chart-card">
+            <div class="chart-head"><div><span>Event-loop responsiveness</span><small>conceptual scheduling delay under the selected workload</small></div><div class="chart-legend"><span><i class="raw"></i>raw sync-on-loop</span><span><i class="pooled"></i>leasepool</span></div></div>
+            <canvas id="pressureChart" height="170" aria-label="Event loop responsiveness comparison chart"></canvas>
+          </div>
+        </div>
+      </div>
+      <div class="lab-note reveal"><span>Important</span><p>leasepool reduces event-loop congestion by offloading synchronous work and bounding executor growth. It cannot make thread-unsafe code safe, remove process serialization cost, or guarantee latency when offered load exceeds capacity.</p></div>
+    </section>
+
+    <section class="section grinder" id="grinder">
+      <div class="section-heading reveal">
+        <div class="eyebrow">05 · WorkGrinder batching</div>
+        <h2>Many callers.<br /><em>One serial batch lane.</em></h2>
+      </div>
+      <div class="grinder-visual reveal">
+        <div class="grinder-callers">
+          <div class="caller-node"><span>A</span><b>route /users</b><small>item 01</small></div>
+          <div class="caller-node"><span>B</span><b>route /files</b><small>item 02</small></div>
+          <div class="caller-node"><span>C</span><b>scheduled job</b><small>item 03</small></div>
+          <div class="caller-node thread"><span>T</span><b>other OS thread</b><small>submit_from_thread</small></div>
+        </div>
+        <div class="grinder-lines"><i></i><i></i><i></i><i></i></div>
+        <div class="grinder-core">
+          <div class="core-orbit"><i></i><i></i><i></i></div>
+          <span class="core-kicker">asyncio.Condition</span>
+          <h3>Pending deque</h3>
+          <div class="deque-row"><i>1</i><i>2</i><i>3</i><i>4</i><i>5</i><i>6</i><i>7</i><i>8</i></div>
+          <p>Trigger when <b>count ≥ threshold</b>, <b>oldest ≥ max_wait</b>, or shutdown must drain.</p>
+        </div>
+        <div class="grinder-gate"><span>drain entire queue</span><i></i></div>
+        <div class="batch-card">
+          <div class="batch-header"><span>batch-17</span><b>one lease</b></div>
+          <div class="batch-workers"><i></i><i></i><i></i><i></i></div>
+          <p>All live items are submitted to one executor, then gathered with per-item outcomes.</p>
+          <div class="batch-outcomes"><span class="ok">value</span><span class="ok">value</span><span class="err">exception</span><span class="cancel">cancelled</span></div>
+        </div>
+      </div>
+      <div class="invariant-grid reveal">
+        <article><span>01</span><h3>Whole-queue drain</h3><p>The threshold starts a batch; it is not a maximum batch size.</p></article>
+        <article><span>02</span><h3>One active lease</h3><p>One grinder processes batches serially and holds at most one lease at a time.</p></article>
+        <article><span>03</span><h3>Precise outcomes</h3><p>Already-submitted items retain their real result when later submission fails.</p></article>
+        <article><span>04</span><h3>Cancellation cleanup</h3><p>Cancelled queued items are removed before they consume backend capacity.</p></article>
+      </div>
+    </section>
+
+    <section class="section adaptive" id="adaptive">
+      <div class="section-heading reveal">
+        <div class="eyebrow">06 · Adaptive sizing and backpressure</div>
+        <h2>A target for idle capacity.<br /><em>A hard ceiling for bursts.</em></h2>
+      </div>
+      <div class="formula-card reveal">
+        <div class="formula">
+          <span>desired</span><b>=</b><strong>min( max_pools, max( min_pools, ⌈ units ÷ units_per_pool ⌉ ) )</strong>
+        </div>
+        <div class="formula-controls">
+          <label>units <input id="unitsInput" type="range" min="0" max="120" value="42" /><output id="unitsOutput">42</output></label>
+          <label>units_per_pool <input id="unitsPerPoolInput" type="range" min="1" max="30" value="10" /><output id="unitsPerPoolOutput">10</output></label>
+          <label>min_pools <input id="minPoolsInput" type="range" min="1" max="5" value="1" /><output id="minPoolsOutput">1</output></label>
+          <label>max_pools <input id="maxPoolsFormulaInput" type="range" min="1" max="8" value="6" /><output id="maxPoolsFormulaOutput">6</output></label>
+        </div>
+        <div class="capacity-visual">
+          <div class="capacity-summary"><span>computed target</span><b id="desiredOutput">5 pools</b><small id="workerCapacityOutput">20 configured workers at 4 per pool</small></div>
+          <div class="capacity-pools" id="capacityPools"></div>
+        </div>
+      </div>
+      <div class="pressure-logic reveal">
+        <article><div class="logic-icon">+</div><h3>Burst above target</h3><p>An acquisition may create extra executors up to <code>max_pools</code>. The adaptive target is not an acquisition ceiling.</p></article>
+        <article><div class="logic-icon">…</div><h3>At hard ceiling</h3><p><code>wait=True</code> sleeps on the availability event; <code>wait=False</code> raises <code>LeaseUnavailableError</code>.</p></article>
+        <article><div class="logic-icon">−</div><h3>Demand falls</h3><p>Only idle or newly released excess executors are removed. Healthy active leases are not revoked to shrink.</p></article>
+      </div>
+    </section>
+
+    <section class="section internals" id="internals">
+      <div class="section-heading reveal">
+        <div class="eyebrow">07 · Internal mechanisms</div>
+        <h2>The architecture’s<br /><em>load-bearing details.</em></h2>
+      </div>
+      <div class="internals-layout">
+        <div class="mechanism-nav reveal" role="tablist" aria-label="Internal mechanism">
+          <button class="active" data-mechanism="lock"><span>01</span><b>State & locking</b><small>RLock + two registries</small></button>
+          <button data-mechanism="checker"><span>02</span><b>Checker loop</b><small>expiry + sizing</small></button>
+          <button data-mechanism="callbacks"><span>03</span><b>Future callbacks</b><small>drain + retire</small></button>
+          <button data-mechanism="ownership"><span>04</span><b>Loop ownership</b><small>cross-thread rules</small></button>
+          <button data-mechanism="logging"><span>05</span><b>Process logging</b><small>queue bridge</small></button>
+        </div>
+        <div class="mechanism-stage reveal" id="mechanismStage">
+          <div class="mechanism-copy">
+            <div class="eyebrow" id="mechanismKicker">Synchronous critical section</div>
+            <h3 id="mechanismTitle">Why a threading.RLock exists inside an async library</h3>
+            <p id="mechanismBody">Executor.submit() is synchronous, while done callbacks can execute on worker or manager threads. The lock makes lease validation, submission, pending-future registration, release, and callback accounting one coherent state transition.</p>
+            <div class="mechanism-points" id="mechanismPoints">
+              <span><i></i>Protects <code>_available</code> and <code>_leased</code></span>
+              <span><i></i>Prevents submit-after-release races</span>
+              <span><i></i>Keeps callbacks backend-thread safe</span>
+            </div>
+          </div>
+          <div class="mechanism-diagram" id="mechanismDiagram" data-view="lock">
+            <div class="lock-viz">
+              <div class="sync-call submit-call"><small>event-loop thread</small><b>submit()</b><i></i></div>
+              <div class="sync-call callback-call"><small>backend thread</small><b>done callback</b><i></i></div>
+              <div class="lock-core"><span>RLock</span><b>atomic lease state</b><div><i>available</i><i>leased</i><i>pending</i></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section backends" id="backends">
+      <div class="section-heading reveal">
+        <div class="eyebrow">08 · Backend topology</div>
+        <h2>Same lease contract.<br /><em>Different execution physics.</em></h2>
+      </div>
+      <div class="backend-grid reveal">
+        <article class="backend-card thread-backend">
+          <div class="backend-visual"><div class="process-shell"><span>Python process</span><div class="worker-row"><i></i><i></i><i></i><i></i></div></div></div>
+          <div class="backend-title"><span>thread</span><b>ThreadPoolExecutor</b></div>
+          <p>Best for blocking I/O, synchronous SDKs, file access, and small blocking operations.</p>
+          <ul><li>Shared process memory</li><li>No pickle boundary</li><li>User code must be thread-safe</li></ul>
+        </article>
+        <article class="backend-card process-backend">
+          <div class="backend-visual"><div class="multi-process"><div></div><div></div><div></div><div></div><span>IPC</span></div></div>
+          <div class="backend-title"><span>process</span><b>ProcessPoolExecutor</b></div>
+          <p>Best for CPU-heavy Python work that benefits from separate processes and CPU cores.</p>
+          <ul><li>Picklable inputs and outputs</li><li>Process startup and IPC cost</li><li>Optional child-log forwarding</li></ul>
+        </article>
+        <article class="backend-card interpreter-backend">
+          <div class="backend-visual"><div class="interpreter-shell"><div><i></i></div><div><i></i></div><div><i></i></div><span>3.14+</span></div></div>
+          <div class="backend-title"><span>interpreter</span><b>InterpreterPoolExecutor</b></div>
+          <p>Python 3.14+ backend exposed through the same build and leasing hook.</p>
+          <ul><li>Version-gated availability</li><li>Thread-name prefix support</li><li>Same retirement semantics</li></ul>
+        </article>
+      </div>
+      <div class="logging-bridge reveal">
+        <div class="logging-copy"><span class="eyebrow">Process log forwarding</span><h3>Child records cross a queue; application logging stays in charge.</h3><p>The manager composes its worker initializer with the user’s initializer, installs a <code>QueueHandler</code> in children, and forwards records through a parent <code>QueueListener</code>.</p></div>
+        <div class="logging-flow"><div><span>worker process</span><b>root logger</b></div><i></i><div><span>multiprocessing</span><b>log queue</b></div><i></i><div><span>parent process</span><b>QueueListener</b></div><i></i><div><span>application</span><b>target logger</b></div></div>
+      </div>
+    </section>
+
+    <section class="section failure" id="failure">
+      <div class="section-heading reveal">
+        <div class="eyebrow">09 · Failure containment</div>
+        <h2>Task errors stay local.<br /><em>Pool failures change topology.</em></h2>
+      </div>
+      <div class="failure-compare reveal">
+        <article class="ordinary-error">
+          <div class="failure-badge">fn</div><div><span>Callable raises ValueError</span><h3>The future fails. The executor remains healthy.</h3><p>Per-task exceptions flow to the original caller and do not poison the pool.</p></div><div class="failure-path good"><i></i><span>reuse</span></div>
+        </article>
+        <article class="broken-error">
+          <div class="failure-badge">!</div><div><span>BrokenExecutor detected</span><h3>The lease record is retired. Minimum capacity is restored.</h3><p>The executor is never returned to <code>_available</code>; shutdown is deferred out of the callback thread.</p></div><div class="failure-path bad"><i></i><span>replace</span></div>
+        </article>
+      </div>
+      <div class="recovery-strip reveal">
+        <div><span>1</span><b>future completes</b><small>callback inspects exception</small></div><i></i><div><span>2</span><b>record retired</b><small>pending set cleared</small></div><i></i><div><span>3</span><b>minimum restored</b><small>new executor created</small></div><i></i><div><span>4</span><b>shutdown deferred</b><small>loop callback or daemon thread</small></div>
+      </div>
+    </section>
+
+    <section class="section api" id="api">
+      <div class="section-heading reveal">
+        <div class="eyebrow">10 · Public API map</div>
+        <h2>A small surface over<br /><em>a deep state machine.</em></h2>
+      </div>
+      <div class="api-map reveal">
+        <article class="api-primary">
+          <div class="api-signature"><span>class</span><b>LeasedExecutorManager</b></div>
+          <p>Creates, leases, sizes, expires, retires, and shuts down executor pools.</p>
+          <div class="method-grid"><code>await start()</code><code>await stop()</code><code>await acquire(...)</code><code>await release(lease_id)</code><code>stats()</code><code>notify_scale_changed()</code></div>
+        </article>
+        <article>
+          <div class="api-signature"><span>class</span><b>ExecutorLease</b></div>
+          <p>Temporary submission capability for exactly one managed executor.</p>
+          <div class="method-grid"><code>executor.submit(...)</code><code>await run(...)</code><code>await release()</code><code>async with</code></div>
+        </article>
+        <article>
+          <div class="api-signature"><span>class</span><b>WorkGrinder</b></div>
+          <p>Serial batch coordinator that leases capacity only when a batch is ready.</p>
+          <div class="method-grid"><code>await submit(...)</code><code>await enqueue(...)</code><code>submit_from_thread(...)</code><code>stats_from_thread(...)</code></div>
+        </article>
+        <article>
+          <div class="api-signature"><span>enum</span><b>ExecutorBackend</b></div>
+          <p>Normalizes backend selection and resolves the corresponding executor class.</p>
+          <div class="method-grid"><code>THREAD</code><code>PROCESS</code><code>INTERPRETER</code></div>
+        </article>
+        <article>
+          <div class="api-signature"><span>config</span><b>ProcessLoggingConfig</b></div>
+          <p>Opt-in child-process logging bridge with level, target logger, and handler policy.</p>
+          <div class="method-grid"><code>enabled</code><code>level</code><code>target_logger</code><code>clear_child_handlers</code></div>
+        </article>
+        <article class="api-errors">
+          <div class="api-signature"><span>errors</span><b>LeasePoolError family</b></div>
+          <p>Explicit failure modes for startup, capacity, expiry, and backend availability.</p>
+          <div class="method-grid"><code>LeasePoolNotStartedError</code><code>LeaseUnavailableError</code><code>LeaseExpiredError</code><code>UnsupportedBackendError</code></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section quickstart" id="quickstart">
+      <div class="quickstart-shell reveal">
+        <div class="quickstart-copy">
+          <div class="eyebrow">11 · Canonical usage</div>
+          <h2>Lease capacity around<br /><em>the synchronous boundary.</em></h2>
+          <p>Start and stop on one event loop. Keep the lease scope explicit. Let the context manager release after the result resolves.</p>
+          <div class="quickstart-notes"><span><i>1</i>manager owns executor lifetime</span><span><i>2</i>lease owns submission rights</span><span><i>3</i>caller owns task semantics</span></div>
+        </div>
+        <div class="code-window">
+          <div class="code-title"><span><i></i><i></i><i></i></span><b>app.py</b><button id="copyCode">Copy</button></div>
+          <pre><code id="quickstartCode"><span class="kw">from</span> leasepool <span class="kw">import</span> ExecutorBackend, LeasedExecutorManager
+
+manager = LeasedExecutorManager(
+    backend=ExecutorBackend.THREAD,
+    max_pools=<span class="num">3</span>,
+    min_pools=<span class="num">1</span>,
+    workers_per_pool=<span class="num">4</span>,
+)
+
+<span class="kw">await</span> manager.start()
+<span class="kw">try</span>:
+    <span class="kw">async with await</span> manager.acquire(
+        owner=<span class="str">"vendor-sdk"</span>,
+        lease_seconds=<span class="num">30</span>,
+    ) <span class="kw">as</span> lease:
+        result = <span class="kw">await</span> lease.run(sync_call, payload)
+<span class="kw">finally</span>:
+    <span class="kw">await</span> manager.stop()</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="section invariants" id="invariants">
+      <div class="section-heading reveal">
+        <div class="eyebrow">12 · Architectural invariants</div>
+        <h2>The rules that keep<br /><em>the system honest.</em></h2>
+      </div>
+      <div class="invariants-list reveal">
+        <article><span>01</span><h3>Raw executors stay private.</h3><p>Callers receive a proxy that cannot shut down managed capacity.</p></article>
+        <article><span>02</span><h3>Release is a submission barrier.</h3><p>New work is rejected immediately, even when old futures are still draining.</p></article>
+        <article><span>03</span><h3>Hard expiry is terminal.</h3><p>An expired executor is shut down and never recycled into available capacity.</p></article>
+        <article><span>04</span><h3>Broken means retired.</h3><p>A backend-level failure changes pool topology; an ordinary task error does not.</p></article>
+        <article><span>05</span><h3>Loop ownership is explicit.</h3><p>Manager and grinder async APIs remain on the loop that started them.</p></article>
+        <article><span>06</span><h3>Shutdown never self-joins.</h3><p>Callback-triggered executor shutdown is deferred beyond backend-owned threads.</p></article>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footer-main">
+      <div class="footer-brand"><span class="brand-mark"><i></i><i></i><i></i></span><div><b>leasepool architecture atlas</b><small>Interactive documentation for v0.1.3</small></div></div>
+      <p>Executor leasing, backpressure, batching, lifecycle control, and adaptive CPU/I/O offloading for async Python.</p>
+    </div>
+    <nav class="footer-links" aria-label="leasepool project links">
+      <a href="https://github.com/jackofsometrades99/leasepool" target="_blank" rel="noopener noreferrer"><span>GitHub</span><small>Source code and issues</small><b>↗</b></a>
+      <a href="https://pypi.org/project/leasepool/" target="_blank" rel="noopener noreferrer"><span>PyPI</span><small>Package and releases</small><b>↗</b></a>
+      <a href="https://leasepool.readthedocs.io/en/latest/" target="_blank" rel="noopener noreferrer"><span>Documentation</span><small>Official usage reference</small><b>↗</b></a>
+    </nav>
+    <div class="footer-bottom">
+      <p>© 2026 Sambhu Nampoothiri G. Website architecture and documentation.</p>
+      <a href="#hero">Return to system view ↑</a>
+    </div>
+  </footer>
+
+  <script src="lease3d.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
